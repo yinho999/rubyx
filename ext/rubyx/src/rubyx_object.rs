@@ -61,6 +61,32 @@ pub(crate) fn python_to_sendable(
         return Ok(SendableValue::List(items));
     }
 
+    if api.is_set(py_val) || api.is_frozen_set(py_val) {
+        let len = api.set_size(py_val);
+        let mut items = Vec::with_capacity(len as usize);
+        let iter = api.object_get_iter(py_val);
+        loop {
+            let item = api.iter_next(iter);
+            if item.is_null() {
+                break;
+            }
+            let result = python_to_sendable(item, api);
+            api.decref(item);
+            match result {
+                Ok(val) => items.push(val),
+                Err(e) => {
+                    api.decref(iter);
+                    return Err(e);
+                }
+            }
+        }
+        if api.has_error() {
+            api.clear_error();
+        }
+        api.decref(iter);
+        return Ok(SendableValue::Set(items));
+    }
+
     if api.list_check(py_val) {
         let len = api.list_size(py_val);
         let mut items = Vec::with_capacity(len as usize);
@@ -1960,15 +1986,16 @@ mod tests {
         api.decref(os);
     }
 
+    // ========== python_to_sendable: set / frozenset ==========
+
     #[test]
     #[serial]
-    fn test_python_to_sendable_set_returns_err() {
+    fn test_python_to_sendable_set_returns_set() {
         use crate::test_helpers::skip_if_no_python;
         let Some(guard) = skip_if_no_python() else {
             return;
         };
         let api = guard.api();
-        // Sets don't have __dict__, so they return Err (not PyObjectRef)
         let globals = api.dict_new();
         let builtins = api
             .import_module("builtins")
@@ -1980,8 +2007,174 @@ mod tests {
         let py_set = result.expect("set eval should succeed");
         assert!(!py_set.is_null());
 
-        let sendable = python_to_sendable(py_set, api);
-        assert!(sendable.is_err(), "set should return Err (no __dict__)");
+        let sendable = python_to_sendable(py_set, api).expect("set should convert to Set");
+        match &sendable {
+            SendableValue::Set(items) => {
+                assert_eq!(items.len(), 3);
+                let mut vals: Vec<i64> = items
+                    .iter()
+                    .map(|item| match item {
+                        SendableValue::Integer(n) => *n,
+                        other => panic!("expected Integer, got {other:?}"),
+                    })
+                    .collect();
+                vals.sort();
+                assert_eq!(vals, vec![1, 2, 3]);
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+        api.decref(py_set);
+        api.decref(builtins);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_frozenset_returns_set() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = api.dict_new();
+        let builtins = api
+            .import_module("builtins")
+            .expect("builtins should import");
+        let key = api.string_from_str("__builtins__");
+        api.dict_set_item(globals, key, builtins);
+        api.decref(key);
+        let result = api.run_string("frozenset({10, 20})", 258, globals, globals);
+        let py_fset = result.expect("frozenset eval should succeed");
+        assert!(!py_fset.is_null());
+
+        let sendable = python_to_sendable(py_fset, api).expect("frozenset should convert to Set");
+        match &sendable {
+            SendableValue::Set(items) => {
+                assert_eq!(items.len(), 2);
+                let mut vals: Vec<i64> = items
+                    .iter()
+                    .map(|item| match item {
+                        SendableValue::Integer(n) => *n,
+                        other => panic!("expected Integer, got {other:?}"),
+                    })
+                    .collect();
+                vals.sort();
+                assert_eq!(vals, vec![10, 20]);
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+        api.decref(py_fset);
+        api.decref(builtins);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_empty_set() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = api.dict_new();
+        let builtins = api
+            .import_module("builtins")
+            .expect("builtins should import");
+        let key = api.string_from_str("__builtins__");
+        api.dict_set_item(globals, key, builtins);
+        api.decref(key);
+        let result = api.run_string("set()", 258, globals, globals);
+        let py_set = result.expect("empty set eval should succeed");
+        assert!(!py_set.is_null());
+
+        let sendable = python_to_sendable(py_set, api).expect("empty set should convert");
+        match &sendable {
+            SendableValue::Set(items) => assert!(items.is_empty()),
+            other => panic!("expected empty Set, got {other:?}"),
+        }
+        api.decref(py_set);
+        api.decref(builtins);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_set_with_mixed_types() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = api.dict_new();
+        let builtins = api
+            .import_module("builtins")
+            .expect("builtins should import");
+        let key = api.string_from_str("__builtins__");
+        api.dict_set_item(globals, key, builtins);
+        api.decref(key);
+        let result = api.run_string("{42, 'hello', 3.14, True}", 258, globals, globals);
+        let py_set = result.expect("mixed set eval should succeed");
+        assert!(!py_set.is_null());
+
+        let sendable = python_to_sendable(py_set, api).expect("mixed set should convert");
+        match &sendable {
+            SendableValue::Set(items) => {
+                assert_eq!(items.len(), 4);
+                let has_int = items
+                    .iter()
+                    .any(|i| matches!(i, SendableValue::Integer(42)));
+                let has_str = items
+                    .iter()
+                    .any(|i| matches!(i, SendableValue::Str(s) if s == "hello"));
+                let has_float = items.iter().any(|i| matches!(i, SendableValue::Float(_)));
+                let has_bool = items.iter().any(|i| matches!(i, SendableValue::Bool(true)));
+                assert!(has_int, "set should contain integer 42");
+                assert!(has_str, "set should contain string 'hello'");
+                assert!(has_float, "set should contain float 3.14");
+                assert!(has_bool, "set should contain bool True");
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+        api.decref(py_set);
+        api.decref(builtins);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_set_with_strings() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = api.dict_new();
+        let builtins = api
+            .import_module("builtins")
+            .expect("builtins should import");
+        let key = api.string_from_str("__builtins__");
+        api.dict_set_item(globals, key, builtins);
+        api.decref(key);
+        let result = api.run_string("{'apple', 'banana', 'cherry'}", 258, globals, globals);
+        let py_set = result.expect("string set eval should succeed");
+        assert!(!py_set.is_null());
+
+        let sendable = python_to_sendable(py_set, api).expect("string set should convert");
+        match &sendable {
+            SendableValue::Set(items) => {
+                assert_eq!(items.len(), 3);
+                let mut vals: Vec<&str> = items
+                    .iter()
+                    .map(|item| match item {
+                        SendableValue::Str(s) => s.as_str(),
+                        other => panic!("expected Str, got {other:?}"),
+                    })
+                    .collect();
+                vals.sort();
+                assert_eq!(vals, vec!["apple", "banana", "cherry"]);
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
         api.decref(py_set);
         api.decref(builtins);
         api.decref(globals);

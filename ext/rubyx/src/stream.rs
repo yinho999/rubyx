@@ -21,6 +21,7 @@ pub(crate) enum SendableValue {
     Float(f64),
     Str(String),
     Bool(bool),
+    Set(Vec<SendableValue>),
     List(Vec<SendableValue>),
     Dict(Vec<(SendableValue, SendableValue)>),
     PyObjectRef(usize),
@@ -38,7 +39,7 @@ impl TryInto<magnus::Value> for SendableValue {
             SendableValue::Float(f) => f.into_value_with(&ruby),
             SendableValue::Str(s) => s.as_str().into_value_with(&ruby),
             SendableValue::Bool(b) => b.into_value_with(&ruby),
-            SendableValue::List(l) => {
+            SendableValue::List(l) | SendableValue::Set(l) => {
                 let ruby_array = ruby.ary_new_capa(l.len());
                 for item in l {
                     let val: Value = item.try_into()?;
@@ -784,6 +785,141 @@ mod tests {
 
             assert!(stream.next().is_none());
             api.decref(os);
+        });
+    }
+
+    // ========== Set: SendableValue::Set → Ruby Array ==========
+
+    #[test]
+    #[serial]
+    fn test_set_converts_to_ruby_array() {
+        with_ruby_python(|_ruby, _api| {
+            let (tx, rx) = unbounded();
+            let (cancel_tx, _cancel_rx) = bounded(1);
+
+            thread::spawn(move || {
+                tx.send(Some(SendableValue::Set(vec![
+                    SendableValue::Integer(1),
+                    SendableValue::Integer(2),
+                    SendableValue::Integer(3),
+                ])))
+                .ok();
+                tx.send(None).ok();
+            });
+
+            let mut stream = AsyncStream::from_channel(rx, cancel_tx);
+            let val = stream.next().unwrap().unwrap();
+
+            let arr = magnus::RArray::try_convert(val).unwrap();
+            assert_eq!(arr.len(), 3);
+
+            let mut items: Vec<i64> = (0..arr.len())
+                .map(|i| i64::try_convert(arr.entry::<Value>(i as isize).unwrap()).unwrap())
+                .collect();
+            items.sort();
+            assert_eq!(items, vec![1, 2, 3]);
+
+            assert!(stream.next().is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_empty_set_converts_to_empty_ruby_array() {
+        with_ruby_python(|_ruby, _api| {
+            let (tx, rx) = unbounded();
+            let (cancel_tx, _cancel_rx) = bounded(1);
+
+            thread::spawn(move || {
+                tx.send(Some(SendableValue::Set(vec![]))).ok();
+                tx.send(None).ok();
+            });
+
+            let mut stream = AsyncStream::from_channel(rx, cancel_tx);
+            let val = stream.next().unwrap().unwrap();
+
+            let arr = magnus::RArray::try_convert(val).unwrap();
+            assert_eq!(arr.len(), 0);
+
+            assert!(stream.next().is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_with_mixed_types_converts_to_ruby_array() {
+        with_ruby_python(|_ruby, _api| {
+            let (tx, rx) = unbounded();
+            let (cancel_tx, _cancel_rx) = bounded(1);
+
+            thread::spawn(move || {
+                tx.send(Some(SendableValue::Set(vec![
+                    SendableValue::Integer(42),
+                    SendableValue::Str("hello".to_string()),
+                    SendableValue::Float(3.14),
+                    SendableValue::Bool(true),
+                ])))
+                .ok();
+                tx.send(None).ok();
+            });
+
+            let mut stream = AsyncStream::from_channel(rx, cancel_tx);
+            let val = stream.next().unwrap().unwrap();
+
+            let arr = magnus::RArray::try_convert(val).unwrap();
+            assert_eq!(arr.len(), 4);
+
+            assert_eq!(
+                i64::try_convert(arr.entry::<Value>(0).unwrap()).unwrap(),
+                42
+            );
+            assert_eq!(
+                String::try_convert(arr.entry::<Value>(1).unwrap()).unwrap(),
+                "hello"
+            );
+            assert!(
+                (f64::try_convert(arr.entry::<Value>(2).unwrap()).unwrap() - 3.14).abs() < 1e-9
+            );
+            assert!(bool::try_convert(arr.entry::<Value>(3).unwrap()).unwrap());
+
+            assert!(stream.next().is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_in_stream_with_other_types() {
+        with_ruby_python(|_ruby, _api| {
+            let (tx, rx) = unbounded();
+            let (cancel_tx, _cancel_rx) = bounded(1);
+
+            thread::spawn(move || {
+                tx.send(Some(SendableValue::Integer(1))).ok();
+                tx.send(Some(SendableValue::Set(vec![
+                    SendableValue::Integer(10),
+                    SendableValue::Integer(20),
+                ])))
+                .ok();
+                tx.send(Some(SendableValue::Str("after".to_string()))).ok();
+                tx.send(None).ok();
+            });
+
+            let mut stream = AsyncStream::from_channel(rx, cancel_tx);
+
+            // First: integer
+            let val = stream.next().unwrap().unwrap();
+            assert_eq!(i64::try_convert(val).unwrap(), 1);
+
+            // Second: set → array
+            let val = stream.next().unwrap().unwrap();
+            let arr = magnus::RArray::try_convert(val).unwrap();
+            assert_eq!(arr.len(), 2);
+
+            // Third: string
+            let val = stream.next().unwrap().unwrap();
+            assert_eq!(String::try_convert(val).unwrap(), "after");
+
+            assert!(stream.next().is_none());
         });
     }
 }

@@ -65,6 +65,13 @@ pub struct PythonApi {
         unsafe extern "C" fn(p: *mut PyObject, pos: isize, o: *mut PyObject) -> c_int,
     >,
 
+    // Set
+    pub py_set_new: Symbol<'static, unsafe extern "C" fn(len: isize) -> *mut PyObject>,
+    pub py_set_check: Symbol<'static, unsafe extern "C" fn(p: *mut PyObject) -> c_int>,
+    pub py_set_size: Symbol<'static, unsafe extern "C" fn(any_set: *mut PyObject) -> isize>,
+    pub py_frozen_set_new: Symbol<'static, unsafe extern "C" fn(len: isize) -> *mut PyObject>,
+    pub py_frozen_set_check: Symbol<'static, unsafe extern "C" fn(p: *mut PyObject) -> c_int>,
+
     // List
     pub py_list_new: Symbol<'static, unsafe extern "C" fn(isize) -> *mut PyObject>,
     pub py_list_size: Symbol<'static, unsafe extern "C" fn(*mut PyObject) -> isize>,
@@ -264,6 +271,18 @@ impl PythonApi {
             unsafe extern "C" fn(*mut PyObject, isize, *mut PyObject) -> c_int,
         > = lib.get(b"PyTuple_SetItem")?;
 
+        // Set
+        let py_set_new: Symbol<unsafe extern "C" fn(isize) -> *mut PyObject> =
+            lib.get(b"PySet_New")?;
+        let py_set_size: Symbol<unsafe extern "C" fn(*mut PyObject) -> isize> =
+            lib.get(b"PySet_Size")?;
+        let py_set_check: Symbol<unsafe extern "C" fn(*mut PyObject) -> c_int> =
+            lib.get(b"PySet_Check")?;
+        let py_frozen_set_new: Symbol<unsafe extern "C" fn(isize) -> *mut PyObject> =
+            lib.get(b"PyFrozenSet_New")?;
+        let py_frozen_set_check: Symbol<unsafe extern "C" fn(*mut PyObject) -> c_int> =
+            lib.get(b"PyFrozenSet_Check")?;
+
         // List
         let py_list_new: Symbol<unsafe extern "C" fn(isize) -> *mut PyObject> =
             lib.get(b"PyList_New")?;
@@ -436,6 +455,12 @@ impl PythonApi {
             py_tuple_size: std::mem::transmute(py_tuple_size),
             py_tuple_get_item: std::mem::transmute(py_tuple_get_item),
             py_tuple_set_item: std::mem::transmute(py_tuple_set_item),
+            // Set
+            py_set_new: std::mem::transmute(py_set_new),
+            py_set_size: std::mem::transmute(py_set_size),
+            py_set_check: std::mem::transmute(py_set_check),
+            py_frozen_set_new: std::mem::transmute(py_frozen_set_new),
+            py_frozen_set_check: std::mem::transmute(py_frozen_set_check),
             // List
             py_list_new: std::mem::transmute(py_list_new),
             py_list_set_item: std::mem::transmute(py_list_set_item),
@@ -736,6 +761,29 @@ impl PythonApi {
 
     pub fn tuple_get_item(&self, obj: *mut PyObject, pos: isize) -> *mut PyObject {
         unsafe { (self.py_tuple_get_item)(obj, pos) }
+    }
+
+    pub fn set_new(&self, size: isize) -> *mut PyObject {
+        unsafe { (self.py_set_new)(size) }
+    }
+
+    pub fn set_size(&self, obj: *mut PyObject) -> isize {
+        if obj.is_null() {
+            return 0;
+        }
+        unsafe { (self.py_set_size)(obj) }
+    }
+
+    pub fn is_set(&self, obj: *mut PyObject) -> bool {
+        unsafe { (self.py_set_check)(obj) == 1 }
+    }
+
+    pub fn frozen_set_new(&self, size: isize) -> *mut PyObject {
+        unsafe { (self.py_frozen_set_new)(size) }
+    }
+
+    pub fn is_frozen_set(&self, obj: *mut PyObject) -> bool {
+        unsafe { (self.py_frozen_set_check)(obj) == 1 }
     }
 
     pub fn list_new(&self, size: isize) -> *mut PyObject {
@@ -6025,5 +6073,204 @@ _loop = asyncio.new_event_loop()
         api.clear_error();
 
         api.decref(py_int);
+    }
+
+    // ========== set / frozenset ==========
+
+    #[test]
+    #[serial]
+    fn test_is_set_returns_true_for_set() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let globals = make_globals(api);
+        let py_set = api
+            .run_string("{1, 2, 3}", PY_EVAL_INPUT, globals, globals)
+            .expect("set eval should succeed");
+
+        assert!(api.is_set(py_set), "should detect set");
+        assert!(!api.is_frozen_set(py_set), "set is not frozenset");
+
+        api.decref(py_set);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_frozen_set_returns_true_for_frozenset() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let globals = make_globals(api);
+        let py_fset = api
+            .run_string("frozenset({10, 20})", PY_EVAL_INPUT, globals, globals)
+            .expect("frozenset eval should succeed");
+
+        assert!(api.is_frozen_set(py_fset), "should detect frozenset");
+        assert!(!api.is_set(py_fset), "frozenset is not set");
+
+        api.decref(py_fset);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_set_returns_false_for_non_sets() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_int = api.long_from_i64(42);
+        assert!(!api.is_set(py_int));
+        assert!(!api.is_frozen_set(py_int));
+
+        let py_str = api.string_from_str("hello");
+        assert!(!api.is_set(py_str));
+        assert!(!api.is_frozen_set(py_str));
+
+        let py_list = api.list_new(0);
+        assert!(!api.is_set(py_list));
+        assert!(!api.is_frozen_set(py_list));
+
+        let py_dict = api.dict_new();
+        assert!(!api.is_set(py_dict));
+        assert!(!api.is_frozen_set(py_dict));
+
+        api.decref(py_int);
+        api.decref(py_str);
+        api.decref(py_list);
+        api.decref(py_dict);
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_new_creates_empty_set() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_set = api.set_new(0);
+        assert!(!py_set.is_null());
+        assert!(api.is_set(py_set));
+
+        api.decref(py_set);
+    }
+
+    #[test]
+    #[serial]
+    fn test_iterate_set_via_get_iter() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let globals = make_globals(api);
+        let py_set = api
+            .run_string("{10, 20, 30}", PY_EVAL_INPUT, globals, globals)
+            .expect("set eval should succeed");
+
+        let py_iter = api.object_get_iter(py_set);
+        assert!(!py_iter.is_null(), "set should be iterable");
+
+        let mut values = vec![];
+        loop {
+            let item = api.iter_next(py_iter);
+            if item.is_null() {
+                break;
+            }
+            values.push(api.long_to_i64(item));
+            api.decref(item);
+        }
+        assert!(!api.has_error());
+
+        values.sort();
+        assert_eq!(values, vec![10, 20, 30]);
+
+        api.decref(py_iter);
+        api.decref(py_set);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_iterate_frozenset_via_get_iter() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let globals = make_globals(api);
+        let py_fset = api
+            .run_string("frozenset({5, 15})", PY_EVAL_INPUT, globals, globals)
+            .expect("frozenset eval should succeed");
+
+        let py_iter = api.object_get_iter(py_fset);
+        assert!(!py_iter.is_null(), "frozenset should be iterable");
+
+        let mut values = vec![];
+        loop {
+            let item = api.iter_next(py_iter);
+            if item.is_null() {
+                break;
+            }
+            values.push(api.long_to_i64(item));
+            api.decref(item);
+        }
+        assert!(!api.has_error());
+
+        values.sort();
+        assert_eq!(values, vec![5, 15]);
+
+        api.decref(py_iter);
+        api.decref(py_fset);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_iterate_empty_set() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_set = api.set_new(0);
+        assert!(!py_set.is_null());
+
+        let py_iter = api.object_get_iter(py_set);
+        assert!(!py_iter.is_null());
+
+        let item = api.iter_next(py_iter);
+        assert!(item.is_null(), "empty set should yield nothing");
+        assert!(!api.has_error());
+
+        api.decref(py_iter);
+        api.decref(py_set);
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_size() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let globals = make_globals(api);
+        let py_set = api
+            .run_string("{1, 2, 3, 4, 5}", PY_EVAL_INPUT, globals, globals)
+            .expect("set eval should succeed");
+
+        let size = unsafe { (api.py_set_size)(py_set) };
+        assert_eq!(size, 5);
+
+        api.decref(py_set);
+        api.decref(globals);
     }
 }
