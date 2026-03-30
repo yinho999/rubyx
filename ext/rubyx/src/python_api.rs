@@ -67,10 +67,10 @@ pub struct PythonApi {
 
     // Set
     pub py_set_new: Symbol<'static, unsafe extern "C" fn(len: isize) -> *mut PyObject>,
-    pub py_set_check: Symbol<'static, unsafe extern "C" fn(p: *mut PyObject) -> c_int>,
+    pub py_set_type: *mut PyObject,
     pub py_set_size: Symbol<'static, unsafe extern "C" fn(any_set: *mut PyObject) -> isize>,
     pub py_frozen_set_new: Symbol<'static, unsafe extern "C" fn(len: isize) -> *mut PyObject>,
-    pub py_frozen_set_check: Symbol<'static, unsafe extern "C" fn(p: *mut PyObject) -> c_int>,
+    pub py_frozen_set_type: *mut PyObject,
 
     // List
     pub py_list_new: Symbol<'static, unsafe extern "C" fn(isize) -> *mut PyObject>,
@@ -276,12 +276,10 @@ impl PythonApi {
             lib.get(b"PySet_New")?;
         let py_set_size: Symbol<unsafe extern "C" fn(*mut PyObject) -> isize> =
             lib.get(b"PySet_Size")?;
-        let py_set_check: Symbol<unsafe extern "C" fn(*mut PyObject) -> c_int> =
-            lib.get(b"PySet_Check")?;
+        let py_set_type: *mut PyObject = *lib.get::<*mut PyObject>(b"PySet_Type")?;
         let py_frozen_set_new: Symbol<unsafe extern "C" fn(isize) -> *mut PyObject> =
             lib.get(b"PyFrozenSet_New")?;
-        let py_frozen_set_check: Symbol<unsafe extern "C" fn(*mut PyObject) -> c_int> =
-            lib.get(b"PyFrozenSet_Check")?;
+        let py_frozen_set_type: *mut PyObject = *lib.get::<*mut PyObject>(b"PyFrozenSet_Type")?;
 
         // List
         let py_list_new: Symbol<unsafe extern "C" fn(isize) -> *mut PyObject> =
@@ -458,9 +456,9 @@ impl PythonApi {
             // Set
             py_set_new: std::mem::transmute(py_set_new),
             py_set_size: std::mem::transmute(py_set_size),
-            py_set_check: std::mem::transmute(py_set_check),
+            py_set_type,
             py_frozen_set_new: std::mem::transmute(py_frozen_set_new),
-            py_frozen_set_check: std::mem::transmute(py_frozen_set_check),
+            py_frozen_set_type,
             // List
             py_list_new: std::mem::transmute(py_list_new),
             py_list_set_item: std::mem::transmute(py_list_set_item),
@@ -775,7 +773,10 @@ impl PythonApi {
     }
 
     pub fn is_set(&self, obj: *mut PyObject) -> bool {
-        unsafe { (self.py_set_check)(obj) == 1 }
+        if obj.is_null() {
+            return false;
+        }
+        unsafe { (self.py_object_is_instance)(obj, self.py_set_type) == 1 }
     }
 
     pub fn frozen_set_new(&self, size: isize) -> *mut PyObject {
@@ -783,7 +784,10 @@ impl PythonApi {
     }
 
     pub fn is_frozen_set(&self, obj: *mut PyObject) -> bool {
-        unsafe { (self.py_frozen_set_check)(obj) == 1 }
+        if obj.is_null() {
+            return false;
+        }
+        unsafe { (self.py_object_is_instance)(obj, self.py_frozen_set_type) == 1 }
     }
 
     pub fn list_new(&self, size: isize) -> *mut PyObject {
