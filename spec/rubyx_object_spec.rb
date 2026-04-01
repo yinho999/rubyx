@@ -516,9 +516,46 @@ RSpec.describe 'RubyxObject', ruby_integration: true do
   # ========== callable? ==========
 
   describe '#callable?' do
-    it 'returns true for functions' do
+    it 'returns true for lambdas' do
       func = Rubyx.eval("lambda x: x * 2")
       expect(func.callable?).to be true
+    end
+
+    it 'returns true for user-defined functions' do
+      ctx = Rubyx.context
+      ctx.eval("def greet(name): return f'Hello {name}'")
+      func = ctx.eval("greet")
+      expect(func.callable?).to be true
+    end
+
+    it 'returns true for classes' do
+      ctx = Rubyx.context
+      ctx.eval("class Dog:\n    def __init__(self, name):\n        self.name = name")
+      cls = ctx.eval("Dog")
+      expect(cls.callable?).to be true
+    end
+
+    it 'returns true for bound methods' do
+      obj = Rubyx.eval("'hello'.upper")
+      expect(obj.callable?).to be true
+    end
+
+    it 'returns true for instances with __call__' do
+      ctx = Rubyx.context
+      ctx.eval(<<~PY)
+        class Multiplier:
+            def __init__(self, factor):
+                self.factor = factor
+            def __call__(self, x):
+                return x * self.factor
+      PY
+      obj = ctx.eval("Multiplier(3)")
+      expect(obj.callable?).to be true
+    end
+
+    it 'returns true for builtin functions' do
+      obj = Rubyx.eval("len")
+      expect(obj.callable?).to be true
     end
 
     it 'returns false for integers' do
@@ -535,6 +572,186 @@ RSpec.describe 'RubyxObject', ruby_integration: true do
 
     it 'returns false for None' do
       expect(Rubyx.eval('None').callable?).to be false
+    end
+
+    it 'returns false for modules' do
+      expect(Rubyx.import('os').callable?).to be false
+    end
+  end
+
+  # ========== calling callable objects ==========
+
+  describe 'calling callable objects' do
+    it 'calls a lambda via __call__' do
+      func = Rubyx.eval("lambda x: x * 2")
+      result = func.__call__(5)
+      expect(result.to_ruby).to eq(10)
+    end
+
+    it 'calls a user-defined function via __call__' do
+      ctx = Rubyx.context
+      ctx.eval("def add(a, b): return a + b")
+      func = ctx.eval("add")
+      result = func.__call__(3, 4)
+      expect(result.to_ruby).to eq(7)
+    end
+
+    it 'calls a class as constructor via __call__' do
+      ctx = Rubyx.context
+      ctx.eval(<<~PY)
+        class Point:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+      PY
+      cls = ctx.eval("Point")
+      instance = cls.__call__(10, 20)
+      expect(instance.x.to_ruby).to eq(10)
+      expect(instance.y.to_ruby).to eq(20)
+    end
+
+    it 'calls a bound method via __call__' do
+      obj = Rubyx.eval("'hello'.upper")
+      result = obj.__call__
+      expect(result.to_ruby).to eq('HELLO')
+    end
+
+    it 'calls an instance with __call__' do
+      ctx = Rubyx.context
+      ctx.eval(<<~PY)
+        class Doubler:
+            def __call__(self, x):
+                return x * 2
+      PY
+      doubler = ctx.eval("Doubler()")
+      result = doubler.__call__(21)
+      expect(result.to_ruby).to eq(42)
+    end
+
+    it 'calls builtin len via __call__' do
+      len_func = Rubyx.eval("len")
+      list = Rubyx.eval("[1, 2, 3]")
+      result = len_func.__call__(list)
+      expect(result.to_ruby).to eq(3)
+    end
+
+    it 'calls a lambda with no arguments' do
+      func = Rubyx.eval("lambda: 42")
+      result = func.__call__
+      expect(result.to_ruby).to eq(42)
+    end
+
+    it 'calls a function with keyword arguments' do
+      ctx = Rubyx.context
+      ctx.eval("def greet(name, greeting='Hello'): return f'{greeting}, {name}!'")
+      func = ctx.eval("greet")
+      result = func.__call__('Alice', greeting: 'Hi')
+      expect(result.to_ruby).to eq('Hi, Alice!')
+    end
+
+    it 'propagates Python errors from callable' do
+      ctx = Rubyx.context
+      ctx.eval("def boom(): raise ValueError('kaboom')")
+      func = ctx.eval("boom")
+      expect { func.__call__ }.to raise_error(StandardError, /kaboom/)
+    end
+
+    it 'returns callable result that is itself callable' do
+      ctx = Rubyx.context
+      ctx.eval("def make_adder(n): return lambda x: x + n")
+      make_adder = ctx.eval("make_adder")
+      add5 = make_adder.__call__(5)
+      expect(add5.callable?).to be true
+      expect(add5.__call__(10).to_ruby).to eq(15)
+    end
+  end
+
+  # ========== call ==========
+
+  describe '#call' do
+    it 'calls a lambda with no arguments' do
+      func = Rubyx.eval("lambda: 42")
+      expect(func.call.to_ruby).to eq(42)
+    end
+
+    it 'calls a lambda with arguments' do
+      func = Rubyx.eval("lambda x, y: x + y")
+      expect(func.call(3, 4).to_ruby).to eq(7)
+    end
+
+    it 'calls a user-defined function' do
+      ctx = Rubyx.context
+      ctx.eval("def double(x): return x * 2")
+      func = ctx.eval("double")
+      expect(func.call(21).to_ruby).to eq(42)
+    end
+
+    it 'calls a class as constructor' do
+      ctx = Rubyx.context
+      ctx.eval(<<~PY)
+        class Point:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+      PY
+      cls = ctx.eval("Point")
+      pt = cls.call(10, 20)
+      expect(pt.x.to_ruby).to eq(10)
+      expect(pt.y.to_ruby).to eq(20)
+    end
+
+    it 'calls a bound method' do
+      obj = Rubyx.eval("'hello'.upper")
+      expect(obj.call.to_ruby).to eq('HELLO')
+    end
+
+    it 'calls a callable instance' do
+      ctx = Rubyx.context
+      ctx.eval(<<~PY)
+        class Doubler:
+            def __call__(self, x):
+                return x * 2
+      PY
+      doubler = ctx.eval("Doubler()")
+      expect(doubler.call(5).to_ruby).to eq(10)
+    end
+
+    it 'calls builtin len' do
+      len_func = Rubyx.eval("len")
+      list = Rubyx.eval("[1, 2, 3]")
+      expect(len_func.call(list).to_ruby).to eq(3)
+    end
+
+    it 'supports keyword arguments' do
+      ctx = Rubyx.context
+      ctx.eval("def greet(name, greeting='Hello'): return f'{greeting}, {name}!'")
+      func = ctx.eval("greet")
+      expect(func.call('Alice', greeting: 'Hi').to_ruby).to eq('Hi, Alice!')
+    end
+
+    it 'raises TypeError for non-callable objects' do
+      obj = Rubyx.eval('42')
+      expect { obj.call }.to raise_error(StandardError, /not callable/)
+    end
+
+    it 'propagates Python errors' do
+      ctx = Rubyx.context
+      ctx.eval("def boom(): raise ValueError('kaboom')")
+      func = ctx.eval("boom")
+      expect { func.call }.to raise_error(StandardError, /kaboom/)
+    end
+
+    it 'supports .() shorthand syntax' do
+      func = Rubyx.eval("lambda x: x * 3")
+      expect(func.(7).to_ruby).to eq(21)
+    end
+
+    it 'supports chained calls (function factory)' do
+      ctx = Rubyx.context
+      ctx.eval("def make_adder(n): return lambda x: x + n")
+      make_adder = ctx.eval("make_adder")
+      add5 = make_adder.call(5)
+      expect(add5.call(10).to_ruby).to eq(15)
     end
   end
 

@@ -95,6 +95,7 @@ fn init(ruby: &magnus::Ruby) -> Result<(), magnus::Error> {
     py_object.define_method("truthy?", method!(RubyxObject::is_truthy, 0))?;
     py_object.define_method("falsy?", method!(RubyxObject::is_falsy, 0))?;
     py_object.define_method("callable?", method!(RubyxObject::is_callable, 0))?;
+    py_object.define_method("call", method!(RubyxObject::call, -1))?;
     py_object.define_method("py_type", method!(RubyxObject::py_type, 0))?;
     py_object.define_method("each", method!(RubyxObject::each, 0))?;
     py_object.include_module(ruby.module_enumerable())?;

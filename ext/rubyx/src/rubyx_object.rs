@@ -121,7 +121,7 @@ pub(crate) fn python_to_sendable(
         let name = std::ffi::CString::new("__dict__").unwrap();
         api.object_has_attr_string(py_val, name.as_ptr()) != 0
     };
-    if api.callable_check(py_val) == 0 && has_dict {
+    if has_dict || api.callable_check(py_val) != 0 {
         api.incref(py_val);
         return Ok(SendableValue::PyObjectRef(py_val as usize));
     }
@@ -785,6 +785,134 @@ impl RubyxObject {
         let gil = self.api.ensure_gil();
         let result = self.api.callable_check(self.py_obj) != 0;
         self.api.release_gil(gil);
+        result
+    }
+
+    pub fn call(&self, args: &[magnus::Value]) -> Result<Value, magnus::Error> {
+        let api = self.api;
+        let gil = api.ensure_gil();
+        let result = (|| -> Result<Value, magnus::Error> {
+            if api.callable_check(self.py_obj) == 0 {
+                return Err(magnus::Error::new(
+                    ruby_helpers::type_error(),
+                    "Python object is not callable",
+                ));
+            }
+            let ruby = Ruby::get().map_err(|e| {
+                magnus::Error::new(
+                    ruby_helpers::runtime_error(),
+                    format!("Ruby VM handle unavailable: {e}"),
+                )
+            })?;
+
+            // Extract positional and keyword arguments
+            let (positional, kwargs) = if let Some(last) = args.last() {
+                if last.is_kind_of(ruby.class_hash()) {
+                    (&args[..args.len() - 1], Some(RHash::try_convert(*last)?))
+                } else {
+                    (args, None)
+                }
+            } else {
+                (args, None)
+            };
+
+            // Args Tuple for args
+            let py_args = api.tuple_new(positional.len() as isize);
+            if py_args.is_null() {
+                return Err(magnus::Error::new(
+                    ruby_helpers::runtime_error(),
+                    "Failed to allocate Python args tuple",
+                ));
+            }
+            let py_args_guard = PyGuard::new(py_args, api).ok_or_else(|| {
+                magnus::Error::new(ruby_helpers::runtime_error(), "Null Python args tuple")
+            })?;
+            for (i, arg) in positional.iter().enumerate() {
+                let py_arg = ruby_to_python(*arg, api)?;
+                if api.tuple_set_item(py_args_guard.ptr(), i as isize, py_arg) != 0 {
+                    api.decref(py_arg);
+                    if let Some(py_err) = PythonApi::extract_exception(api) {
+                        return Err(magnus::Error::from(py_err));
+                    }
+                    return Err(magnus::Error::new(
+                        ruby_helpers::runtime_error(),
+                        "Failed to set tuple argument",
+                    ));
+                }
+            }
+
+            // kwargs dict
+            let py_kwargs_guard = if let Some(hash) = kwargs {
+                let dict = api.dict_new();
+                if dict.is_null() {
+                    return Err(magnus::Error::new(
+                        ruby_helpers::runtime_error(),
+                        "Failed to allocate kwargs dict",
+                    ));
+                }
+                let guard = PyGuard::new(dict, api).ok_or_else(|| {
+                    magnus::Error::new(ruby_helpers::runtime_error(), "Null kwargs dict")
+                })?;
+                hash.foreach(|k: Value, v: Value| {
+                    let key = if let Ok(s) = String::try_convert(k) {
+                        s
+                    } else if let Ok(sym) = Symbol::try_convert(k) {
+                        sym.name()?.to_string()
+                    } else {
+                        return Err(magnus::Error::new(
+                            ruby_helpers::type_error(),
+                            "kwargs keys must be String or Symbol",
+                        ));
+                    };
+                    let py_key = key.to_python(api).map_err(|e| {
+                        magnus::Error::new(ruby_helpers::runtime_error(), format!("{e:?}"))
+                    })?;
+                    let py_val = ruby_to_python(v, api)?;
+                    let rc = api.dict_set_item(guard.ptr(), py_key, py_val);
+                    api.decref(py_key);
+                    api.decref(py_val);
+                    if rc != 0 {
+                        if let Some(py_err) = PythonApi::extract_exception(api) {
+                            return Err(magnus::Error::from(py_err));
+                        }
+                        return Err(magnus::Error::new(
+                            ruby_helpers::runtime_error(),
+                            "Failed to set kwargs item",
+                        ));
+                    }
+                    Ok(ForEach::Continue)
+                })?;
+                Some(guard)
+            } else {
+                None
+            };
+
+            let py_kwargs_ptr = py_kwargs_guard
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |g| g.ptr());
+            // call the python callable with args and kwargs
+            let py_result = api.object_call(self.py_obj, py_args_guard.ptr(), py_kwargs_ptr);
+            if py_result.is_null() {
+                if let Some(py_err) = PythonApi::extract_exception(api) {
+                    return Err(magnus::Error::from(py_err));
+                }
+                return Err(magnus::Error::new(
+                    ruby_helpers::runtime_error(),
+                    "Python call failed",
+                ));
+            }
+            let py_result_guard = PyGuard::new(py_result, api).ok_or_else(|| {
+                magnus::Error::new(ruby_helpers::runtime_error(), "Null Python result")
+            })?;
+            let wrapper = RubyxObject::new(py_result_guard.ptr(), api).ok_or_else(|| {
+                magnus::Error::new(
+                    ruby_helpers::runtime_error(),
+                    "Failed to wrap Python result",
+                )
+            })?;
+            Ok(wrapper.into_value_with(&ruby))
+        })();
+        api.release_gil(gil);
         result
     }
 
@@ -1694,6 +1822,206 @@ mod tests {
         });
     }
 
+    // ========== call tests ==========
+
+    #[test]
+    #[serial]
+    fn test_call_lambda_no_args() {
+        with_ruby_python(|_ruby, api| {
+            let globals = crate::eval::make_globals(api);
+            let py_func = api
+                .run_string("lambda: 42", 258, globals.ptr(), globals.ptr())
+                .expect("lambda eval should succeed");
+            let wrapper = RubyxObject::new(py_func, api).unwrap();
+
+            let result = wrapper.call(&[]).expect("call should succeed");
+            let obj = Obj::<RubyxObject>::try_convert(result).expect("should be RubyxObject");
+            assert_eq!(api.long_to_i64(obj.as_ptr()), 42);
+
+            drop(wrapper);
+            api.decref(py_func);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_call_lambda_with_args() {
+        with_ruby_python(|ruby, api| {
+            let globals = crate::eval::make_globals(api);
+            let py_func = api
+                .run_string("lambda x, y: x + y", 258, globals.ptr(), globals.ptr())
+                .expect("lambda eval should succeed");
+            let wrapper = RubyxObject::new(py_func, api).unwrap();
+
+            let args = vec![3_i64.into_value_with(ruby), 4_i64.into_value_with(ruby)];
+            let result = wrapper.call(&args).expect("call should succeed");
+            let obj = Obj::<RubyxObject>::try_convert(result).expect("should be RubyxObject");
+            assert_eq!(api.long_to_i64(obj.as_ptr()), 7);
+
+            drop(wrapper);
+            api.decref(py_func);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_call_builtin_function() {
+        with_ruby_python(|ruby, api| {
+            let builtins = api
+                .import_module("builtins")
+                .expect("builtins should import");
+            let len_func = api.object_get_attr_string(builtins, "len");
+            let wrapper = RubyxObject::new(len_func, api).unwrap();
+
+            let globals = crate::eval::make_globals(api);
+            let py_list = api
+                .run_string("[1, 2, 3]", 258, globals.ptr(), globals.ptr())
+                .expect("list eval should succeed");
+            let list_wrapper = RubyxObject::new(py_list, api).unwrap();
+
+            let args = vec![list_wrapper.into_value_with(ruby)];
+            let result = wrapper.call(&args).expect("call should succeed");
+            let obj = Obj::<RubyxObject>::try_convert(result).expect("should be RubyxObject");
+            assert_eq!(api.long_to_i64(obj.as_ptr()), 3);
+
+            drop(wrapper);
+            api.decref(len_func);
+            api.decref(builtins);
+            api.decref(py_list);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_call_with_kwargs() {
+        with_ruby_python(|ruby, api| {
+            let globals = crate::eval::make_globals(api);
+            let _ = api.run_string(
+                "def greet(name, greeting='Hello'): return f'{greeting}, {name}!'",
+                257,
+                globals.ptr(),
+                globals.ptr(),
+            );
+            let key = api.string_from_str("greet");
+            let func = api.dict_get_item(globals.ptr(), key);
+            api.decref(key);
+            let wrapper = RubyxObject::new(func, api).unwrap();
+
+            let kwargs = ruby.hash_new();
+            kwargs
+                .aset(ruby.sym_new("greeting"), "Hi".into_value_with(ruby))
+                .unwrap();
+            let args = vec!["Alice".into_value_with(ruby), kwargs.into_value_with(ruby)];
+            let result = wrapper
+                .call(&args)
+                .expect("call with kwargs should succeed");
+            let obj = Obj::<RubyxObject>::try_convert(result).expect("should be RubyxObject");
+            assert_eq!(
+                api.string_to_string(obj.as_ptr()),
+                Some("Hi, Alice!".to_string())
+            );
+
+            drop(wrapper);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_call_class_as_constructor() {
+        with_ruby_python(|ruby, api| {
+            let globals = crate::eval::make_globals(api);
+            let _ = api.run_string(
+                "class Pt:\n    def __init__(self, x):\n        self.x = x",
+                257,
+                globals.ptr(),
+                globals.ptr(),
+            );
+            let key = api.string_from_str("Pt");
+            let cls = api.dict_get_item(globals.ptr(), key);
+            api.decref(key);
+            let wrapper = RubyxObject::new(cls, api).unwrap();
+
+            let args = vec![10_i64.into_value_with(ruby)];
+            let result = wrapper.call(&args).expect("class call should succeed");
+            let obj = Obj::<RubyxObject>::try_convert(result).expect("should be RubyxObject");
+
+            let x_attr = api.object_get_attr_string(obj.as_ptr(), "x");
+            assert!(!x_attr.is_null());
+            assert_eq!(api.long_to_i64(x_attr), 10);
+            api.decref(x_attr);
+
+            drop(wrapper);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_call_non_callable_raises_error() {
+        with_ruby_python(|_ruby, api| {
+            let py_int = api.long_from_i64(42);
+            let wrapper = RubyxObject::new(py_int, api).unwrap();
+
+            let result = wrapper.call(&[]);
+            assert!(result.is_err(), "calling non-callable should error");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("not callable"),
+                "error should mention not callable, got: {err_msg}"
+            );
+
+            drop(wrapper);
+            api.decref(py_int);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_call_propagates_python_error() {
+        with_ruby_python(|_ruby, api| {
+            let globals = crate::eval::make_globals(api);
+            let _ = api.run_string(
+                "def explode(): raise ValueError('boom')",
+                257,
+                globals.ptr(),
+                globals.ptr(),
+            );
+            let key = api.string_from_str("explode");
+            let func = api.dict_get_item(globals.ptr(), key);
+            api.decref(key);
+            let wrapper = RubyxObject::new(func, api).unwrap();
+
+            let result = wrapper.call(&[]);
+            assert!(result.is_err(), "call that raises should return error");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("boom"),
+                "error should contain Python message, got: {err_msg}"
+            );
+
+            drop(wrapper);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_call_returns_rubyx_object() {
+        with_ruby_python(|_ruby, api| {
+            let globals = crate::eval::make_globals(api);
+            let py_func = api
+                .run_string("lambda: [1, 2, 3]", 258, globals.ptr(), globals.ptr())
+                .expect("lambda eval should succeed");
+            let wrapper = RubyxObject::new(py_func, api).unwrap();
+
+            let result = wrapper.call(&[]).expect("call should succeed");
+            let obj = Obj::<RubyxObject>::try_convert(result).expect("should be RubyxObject");
+            assert!(api.list_check(obj.as_ptr()));
+            assert_eq!(api.list_size(obj.as_ptr()), 3);
+
+            drop(wrapper);
+            api.decref(py_func);
+        });
+    }
+
     // ========== is_truthy / is_falsy tests ==========
 
     #[test]
@@ -2178,6 +2506,228 @@ mod tests {
         api.decref(py_set);
         api.decref(builtins);
         api.decref(globals);
+    }
+
+    // ========== python_to_sendable: callable ==========
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_user_defined_function() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = crate::eval::make_globals(api);
+        let py_func = api.run_string(
+            "def greet(name): return f'Hello {name}'\ngreet",
+            257, // Py_file_input for statements
+            globals.ptr(),
+            globals.ptr(),
+        );
+        // file_input returns None; retrieve the function from globals
+        drop(py_func);
+        let key = api.string_from_str("greet");
+        let func = api.dict_get_item(globals.ptr(), key);
+        api.decref(key);
+        assert!(!func.is_null(), "greet function should exist in globals");
+        assert!(api.callable_check(func) != 0, "greet should be callable");
+
+        let sendable = python_to_sendable(func, api)
+            .expect("user-defined function should convert via PyObjectRef");
+        match &sendable {
+            SendableValue::PyObjectRef(addr) => {
+                assert_eq!(*addr, func as usize);
+            }
+            other => panic!("expected PyObjectRef for function, got {other:?}"),
+        }
+        // Clean up: decref the incref from python_to_sendable
+        // dict_get_item returns a borrowed ref, so only the sendable's incref needs cleanup
+        api.decref(func);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_lambda() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = crate::eval::make_globals(api);
+        let py_lambda = api
+            .run_string("lambda x: x * 2", 258, globals.ptr(), globals.ptr())
+            .expect("lambda eval should succeed");
+        assert!(!py_lambda.is_null());
+        assert!(
+            api.callable_check(py_lambda) != 0,
+            "lambda should be callable"
+        );
+
+        let sendable =
+            python_to_sendable(py_lambda, api).expect("lambda should convert via PyObjectRef");
+        match &sendable {
+            SendableValue::PyObjectRef(addr) => {
+                assert_eq!(*addr, py_lambda as usize);
+            }
+            other => panic!("expected PyObjectRef for lambda, got {other:?}"),
+        }
+        api.decref(py_lambda); // sendable's incref
+        api.decref(py_lambda); // run_string's ref
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_builtin_function() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let builtins = api
+            .import_module("builtins")
+            .expect("builtins should import");
+        let len_func = api.object_get_attr_string(builtins, "len");
+        assert!(!len_func.is_null(), "len should be accessible");
+        assert!(api.callable_check(len_func) != 0, "len should be callable");
+
+        let sendable = python_to_sendable(len_func, api)
+            .expect("builtin function should convert via PyObjectRef");
+        match &sendable {
+            SendableValue::PyObjectRef(addr) => {
+                assert_eq!(*addr, len_func as usize);
+            }
+            other => panic!("expected PyObjectRef for builtin function, got {other:?}"),
+        }
+        api.decref(len_func); // sendable's incref
+        api.decref(len_func); // get_attr_string ref
+        api.decref(builtins);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_class() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = crate::eval::make_globals(api);
+        // Define a class (classes are callable — calling them constructs instances)
+        let _ = api.run_string(
+            "class Greeter:\n    def __init__(self, name):\n        self.name = name",
+            257,
+            globals.ptr(),
+            globals.ptr(),
+        );
+        let key = api.string_from_str("Greeter");
+        let cls = api.dict_get_item(globals.ptr(), key);
+        api.decref(key);
+        assert!(!cls.is_null(), "Greeter class should exist in globals");
+        assert!(api.callable_check(cls) != 0, "classes should be callable");
+
+        let sendable = python_to_sendable(cls, api).expect("class should convert via PyObjectRef");
+        match &sendable {
+            SendableValue::PyObjectRef(addr) => {
+                assert_eq!(*addr, cls as usize);
+            }
+            other => panic!("expected PyObjectRef for class, got {other:?}"),
+        }
+        api.decref(cls); // sendable's incref
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_instance_with_call() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = crate::eval::make_globals(api);
+        // Create an instance with __call__
+        let py_obj = api
+            .run_string(
+                "type('Adder', (), {'__call__': lambda self, x, y: x + y})()",
+                258,
+                globals.ptr(),
+                globals.ptr(),
+            )
+            .expect("callable instance eval should succeed");
+        assert!(!py_obj.is_null());
+        assert!(
+            api.callable_check(py_obj) != 0,
+            "instance with __call__ should be callable"
+        );
+
+        let sendable = python_to_sendable(py_obj, api)
+            .expect("callable instance should convert via PyObjectRef");
+        match &sendable {
+            SendableValue::PyObjectRef(addr) => {
+                assert_eq!(*addr, py_obj as usize);
+            }
+            other => panic!("expected PyObjectRef for callable instance, got {other:?}"),
+        }
+        api.decref(py_obj); // sendable's incref
+        api.decref(py_obj); // run_string ref
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_callable_is_callable_check() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = crate::eval::make_globals(api);
+        let py_lambda = api
+            .run_string("lambda: 42", 258, globals.ptr(), globals.ptr())
+            .expect("lambda eval should succeed");
+
+        let sendable = python_to_sendable(py_lambda, api).expect("lambda should convert");
+        match &sendable {
+            SendableValue::PyObjectRef(addr) => {
+                // Verify the wrapped object is still callable
+                let ptr = *addr as *mut PyObject;
+                assert!(
+                    api.callable_check(ptr) != 0,
+                    "wrapped callable should still report callable"
+                );
+            }
+            other => panic!("expected PyObjectRef, got {other:?}"),
+        }
+        api.decref(py_lambda);
+        api.decref(py_lambda);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_callable_method() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        // Get a bound method: "hello".upper
+        let globals = crate::eval::make_globals(api);
+        let py_method = api
+            .run_string("'hello'.upper", 258, globals.ptr(), globals.ptr())
+            .expect("bound method eval should succeed");
+        assert!(!py_method.is_null());
+        assert!(
+            api.callable_check(py_method) != 0,
+            "bound method should be callable"
+        );
+
+        let sendable = python_to_sendable(py_method, api)
+            .expect("bound method should convert via PyObjectRef");
+        assert!(
+            matches!(sendable, SendableValue::PyObjectRef(_)),
+            "bound method should be PyObjectRef"
+        );
+        api.decref(py_method); // sendable's incref
+        api.decref(py_method); // run_string ref
     }
 
     #[test]

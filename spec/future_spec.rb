@@ -648,4 +648,159 @@ RSpec.describe 'Rubyx::Future', ruby_integration: true do
       expect(future.await).to eq({ 'key' => 'value' })
     end
   end
+
+  # ========== Callable objects via await ==========
+
+  describe 'Rubyx.await with callable objects' do
+    it 'returns a lambda as RubyxObject' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval("async def get_func(): return lambda x: x * 3")
+      coro = ctx.eval("get_func()")
+
+      result = Rubyx.await(coro)
+      expect(result).to be_a(RubyxObject)
+      expect(result.callable?).to be true
+    end
+
+    it 'returned lambda is invocable via __call__' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval("async def get_doubler(): return lambda x: x * 2")
+      coro = ctx.eval("get_doubler()")
+
+      func = Rubyx.await(coro)
+      result = func.__call__(21)
+      expect(result.to_ruby).to eq(42)
+    end
+
+    it 'returns a user-defined function' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval(<<~PY)
+        def add(a, b):
+            return a + b
+        async def get_add():
+            return add
+      PY
+      coro = ctx.eval("get_add()")
+
+      func = Rubyx.await(coro)
+      expect(func).to be_a(RubyxObject)
+      expect(func.callable?).to be true
+      expect(func.__call__(3, 4).to_ruby).to eq(7)
+    end
+
+    it 'returns a class that can construct instances' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval(<<~PY)
+        class Dog:
+            def __init__(self, name):
+                self.name = name
+        async def get_dog_class():
+            return Dog
+      PY
+      coro = ctx.eval("get_dog_class()")
+
+      cls = Rubyx.await(coro)
+      expect(cls).to be_a(RubyxObject)
+      expect(cls.callable?).to be true
+
+      dog = cls.__call__('Rex')
+      expect(dog.name.to_ruby).to eq('Rex')
+    end
+
+    it 'returns a builtin function' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval("async def get_len(): return len")
+      coro = ctx.eval("get_len()")
+
+      len_func = Rubyx.await(coro)
+      expect(len_func).to be_a(RubyxObject)
+      expect(len_func.callable?).to be true
+    end
+
+    it 'returns a callable instance with __call__' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval(<<~PY)
+        class Multiplier:
+            def __init__(self, factor):
+                self.factor = factor
+            def __call__(self, x):
+                return x * self.factor
+        async def get_tripler():
+            return Multiplier(3)
+      PY
+      coro = ctx.eval("get_tripler()")
+
+      tripler = Rubyx.await(coro)
+      expect(tripler).to be_a(RubyxObject)
+      expect(tripler.callable?).to be true
+      expect(tripler.__call__(7).to_ruby).to eq(21)
+    end
+
+    it 'returns a closure that captures state' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval(<<~PY)
+        async def get_counter():
+            count = [0]
+            def increment():
+                count[0] += 1
+                return count[0]
+            return increment
+      PY
+      coro = ctx.eval("get_counter()")
+
+      counter = Rubyx.await(coro)
+      expect(counter.__call__.to_ruby).to eq(1)
+      expect(counter.__call__.to_ruby).to eq(2)
+      expect(counter.__call__.to_ruby).to eq(3)
+    end
+  end
+
+  describe 'future.await with callable objects' do
+    it 'returns callable via future.await' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval("async def get_func(): return lambda x: x + 1")
+
+      future = ctx.async_await("get_func()")
+      func = future.await
+      expect(func).to be_a(RubyxObject)
+      expect(func.callable?).to be true
+      expect(func.__call__(9).to_ruby).to eq(10)
+    end
+
+    it 'returns a function factory result via future.await' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval(<<~PY)
+        def make_adder(n):
+            return lambda x: x + n
+        async def get_add5():
+            return make_adder(5)
+      PY
+
+      future = ctx.async_await("get_add5()")
+      add5 = future.await
+      expect(add5.__call__(10).to_ruby).to eq(15)
+    end
+  end
+
+  describe 'ctx.await with callable objects' do
+    it 'returns callable via ctx.await' do
+      ctx = Rubyx.context
+      ctx.eval("import asyncio")
+      ctx.eval("async def get_func(): return lambda x: x ** 2")
+
+      func = ctx.await("get_func()")
+      expect(func).to be_a(RubyxObject)
+      expect(func.callable?).to be true
+      expect(func.__call__(5).to_ruby).to eq(25)
+    end
+  end
 end
