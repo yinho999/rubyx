@@ -1,8 +1,9 @@
-use crate::api;
 use crate::python_ffi::PyObject;
 use crate::ruby_helpers::runtime_error;
 use crate::rubyx_object::{python_to_sendable, RubyxObject};
+use crate::{api, ruby_helpers};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use magnus::encoding::EncodingCapable;
 use magnus::value::ReprValue;
 use magnus::{IntoValue, Value};
 use std::thread;
@@ -21,6 +22,7 @@ pub(crate) enum SendableValue {
     Float(f64),
     Str(String),
     Bool(bool),
+    Bytes(Vec<u8>),
     Set(Vec<SendableValue>),
     List(Vec<SendableValue>),
     Dict(Vec<(SendableValue, SendableValue)>),
@@ -39,6 +41,14 @@ impl TryInto<magnus::Value> for SendableValue {
             SendableValue::Float(f) => f.into_value_with(&ruby),
             SendableValue::Str(s) => s.as_str().into_value_with(&ruby),
             SendableValue::Bool(b) => b.into_value_with(&ruby),
+            SendableValue::Bytes(b) => {
+                let s = ruby.str_from_slice(&b);
+                s.enc_associate(ruby.find_encoding("ASCII-8BIT").ok_or(magnus::Error::new(
+                    ruby_helpers::no_method_error(),
+                    "No ASCII-8BIT",
+                ))?)?;
+                s.as_value()
+            }
             SendableValue::List(l) | SendableValue::Set(l) => {
                 let ruby_array = ruby.ary_new_capa(l.len());
                 for item in l {

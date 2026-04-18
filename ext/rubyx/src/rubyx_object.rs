@@ -4,10 +4,11 @@ use crate::python_ffi::PyObject;
 use crate::python_guard::PyGuard;
 use crate::ruby_helpers;
 use crate::stream::SendableValue;
+use magnus::encoding::EncodingCapable;
 use magnus::r_hash::ForEach;
 use magnus::typed_data::Obj;
 use magnus::value::ReprValue;
-use magnus::{Class, IntoValue, RHash, Ruby, Symbol, TryConvert, Value};
+use magnus::{Class, IntoValue, RHash, RString, Ruby, Symbol, TryConvert, Value};
 use std::ffi::CString;
 
 const RUBY_IMPLICIT_CONVERSIONS: &[&str] = &[
@@ -50,6 +51,24 @@ pub(crate) fn python_to_sendable(
             return Err("Cannot decode Python string as UTF-8".to_string());
         };
         return Ok(SendableValue::Str(val));
+    }
+    if api.bytes_check(py_val) {
+        let Some(val) = api.bytes_to_vec(py_val) else {
+            if api.has_error() {
+                api.clear_error();
+            }
+            return Err("Cannot decode Python bytes".to_string());
+        };
+        return Ok(SendableValue::Bytes(val));
+    }
+    if api.bytearray_check(py_val) {
+        let Some(val) = api.bytearray_to_vec(py_val) else {
+            if api.has_error() {
+                api.clear_error();
+            }
+            return Err("Cannot read Python bytearray".to_string());
+        };
+        return Ok(SendableValue::Bytes(val));
     }
     if api.tuple_check(py_val) {
         let len = api.tuple_size(py_val);
@@ -179,6 +198,24 @@ pub(crate) fn ruby_to_python(
         return Ok(py_str);
     }
     if value.is_kind_of(ruby.class_string()) {
+        let rstr = RString::try_convert(value)?;
+        // ASCII-8BIT means bytes/bytearray
+        let enc = rstr.enc_get();
+        let ascii_8_bit = ruby
+            .find_encindex("ASCII-8BIT")
+            .map_err(|_| magnus::Error::new(ruby_helpers::runtime_error(), "No ASCII-8BIT"))?;
+        if enc == ascii_8_bit {
+            let bytes = unsafe { rstr.as_slice() };
+            let py_bytes = api.bytes_from_slice(bytes);
+            if py_bytes.is_null() {
+                return Err(magnus::Error::new(
+                    ruby_helpers::runtime_error(),
+                    "Failed to create Python bytes from String",
+                ));
+            }
+            return Ok(py_bytes);
+        }
+        // UTF-8 string conversion
         let val = String::try_convert(value)?;
         return val
             .to_python(api)
@@ -2758,5 +2795,292 @@ mod tests {
             python_to_sendable(api.py_none, api),
             Ok(SendableValue::Nil)
         ));
+    }
+
+    // ========== python_to_sendable: bytes/bytearray ==========
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_bytes() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_bytes = api.bytes_from_slice(b"hello");
+        let result = python_to_sendable(py_bytes, api);
+        assert!(
+            matches!(&result, Ok(SendableValue::Bytes(v)) if v == b"hello"),
+            "Python bytes should convert to SendableValue::Bytes, got: {:?}",
+            result
+        );
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_bytes_empty() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_bytes = api.bytes_from_slice(b"");
+        let result = python_to_sendable(py_bytes, api);
+        assert!(
+            matches!(&result, Ok(SendableValue::Bytes(v)) if v.is_empty()),
+            "Empty Python bytes should convert to empty Bytes, got: {:?}",
+            result
+        );
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_bytes_with_nulls() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let data: &[u8] = b"\x00\x01\xff\x00\xfe";
+        let py_bytes = api.bytes_from_slice(data);
+        let result = python_to_sendable(py_bytes, api);
+        assert!(
+            matches!(&result, Ok(SendableValue::Bytes(v)) if v.as_slice() == data),
+            "Bytes with NULs should roundtrip, got: {:?}",
+            result
+        );
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_bytearray() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_ba = api.bytearray_from_slice(b"world");
+        let result = python_to_sendable(py_ba, api);
+        assert!(
+            matches!(&result, Ok(SendableValue::Bytes(v)) if v == b"world"),
+            "Python bytearray should convert to SendableValue::Bytes, got: {:?}",
+            result
+        );
+        api.decref(py_ba);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_bytearray_empty() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_ba = api.bytearray_from_slice(b"");
+        let result = python_to_sendable(py_ba, api);
+        assert!(
+            matches!(&result, Ok(SendableValue::Bytes(v)) if v.is_empty()),
+            "Empty bytearray should convert to empty Bytes, got: {:?}",
+            result
+        );
+        api.decref(py_ba);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_bytes_not_string() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        // Python bytes must not produce SendableValue::Str
+        let py_bytes = api.bytes_from_slice(b"hello");
+        let result = python_to_sendable(py_bytes, api);
+        assert!(
+            !matches!(&result, Ok(SendableValue::Str(_))),
+            "Python bytes must not become Str"
+        );
+        assert!(
+            !matches!(&result, Ok(SendableValue::PyObjectRef(_))),
+            "Python bytes must not fall through to PyObjectRef"
+        );
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_bytes_in_list() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        // [b"hello", 42, b"\x00\xff"]
+        let py_list = api.list_new(3);
+        api.list_set_item(py_list, 0, api.bytes_from_slice(b"hello"));
+        api.list_set_item(py_list, 1, api.long_from_i64(42));
+        api.list_set_item(py_list, 2, api.bytes_from_slice(b"\x00\xff"));
+
+        let result = python_to_sendable(py_list, api).expect("list with bytes should convert");
+        if let SendableValue::List(items) = result {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(&items[0], SendableValue::Bytes(v) if v == b"hello"));
+            assert!(matches!(&items[1], SendableValue::Integer(42)));
+            assert!(matches!(&items[2], SendableValue::Bytes(v) if v == b"\x00\xff"));
+        } else {
+            panic!("Expected List, got: {:?}", result);
+        }
+        api.decref(py_list);
+    }
+
+    #[test]
+    #[serial]
+    fn test_python_to_sendable_bytes_as_dict_value() {
+        use crate::test_helpers::skip_if_no_python;
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_dict = api.dict_new();
+        let key = api.string_from_str("data");
+        let val = api.bytes_from_slice(b"\xde\xad\xbe\xef");
+        api.dict_set_item(py_dict, key, val);
+        api.decref(key);
+        api.decref(val);
+
+        let result =
+            python_to_sendable(py_dict, api).expect("dict with bytes value should convert");
+        if let SendableValue::Dict(entries) = result {
+            assert_eq!(entries.len(), 1);
+            assert!(matches!(&entries[0].0, SendableValue::Str(s) if s == "data"));
+            assert!(matches!(&entries[0].1, SendableValue::Bytes(v) if v == b"\xde\xad\xbe\xef"));
+        } else {
+            panic!("Expected Dict, got: {:?}", result);
+        }
+        api.decref(py_dict);
+    }
+
+    // ========== ruby_to_python: ASCII-8BIT String → Python bytes ==========
+
+    #[test]
+    #[serial]
+    fn test_ruby_to_python_ascii_8bit_string_becomes_bytes() {
+        with_ruby_python(|ruby, api| {
+            let s = ruby.str_from_slice(b"hello");
+            s.enc_associate(
+                ruby.find_encoding("ASCII-8BIT")
+                    .expect("ASCII-8BIT must exist"),
+            )
+            .unwrap();
+
+            let py_obj = ruby_to_python(s.as_value(), api)
+                .expect("ASCII-8BIT string conversion should succeed");
+
+            assert!(api.bytes_check(py_obj), "Should produce Python bytes");
+            assert!(!api.is_string(py_obj), "Should NOT produce Python str");
+
+            let back = api.bytes_to_vec(py_obj).unwrap();
+            assert_eq!(back, b"hello");
+            api.decref(py_obj);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_ruby_to_python_ascii_8bit_empty() {
+        with_ruby_python(|ruby, api| {
+            let s = ruby.str_from_slice(b"");
+            s.enc_associate(
+                ruby.find_encoding("ASCII-8BIT")
+                    .expect("ASCII-8BIT must exist"),
+            )
+            .unwrap();
+
+            let py_obj =
+                ruby_to_python(s.as_value(), api).expect("empty ASCII-8BIT should convert");
+
+            assert!(api.bytes_check(py_obj));
+            let back = api.bytes_to_vec(py_obj).unwrap();
+            assert!(back.is_empty());
+            api.decref(py_obj);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_ruby_to_python_ascii_8bit_with_nulls() {
+        with_ruby_python(|ruby, api| {
+            let data: &[u8] = b"\x00\x01\x02\xff\xfe\x00";
+            let s = ruby.str_from_slice(data);
+            s.enc_associate(
+                ruby.find_encoding("ASCII-8BIT")
+                    .expect("ASCII-8BIT must exist"),
+            )
+            .unwrap();
+
+            let py_obj =
+                ruby_to_python(s.as_value(), api).expect("binary data with NULs should convert");
+
+            assert!(api.bytes_check(py_obj));
+            let back = api.bytes_to_vec(py_obj).unwrap();
+            assert_eq!(back, data);
+            api.decref(py_obj);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_ruby_to_python_utf8_string_stays_str() {
+        with_ruby_python(|ruby, api| {
+            // Regular UTF-8 string must still become Python str, not bytes
+            let py_str = ruby_to_python("hello".into_value_with(ruby), api)
+                .expect("UTF-8 string should convert");
+
+            assert!(api.is_string(py_str), "UTF-8 should produce Python str");
+            assert!(!api.bytes_check(py_str), "UTF-8 should NOT produce bytes");
+            assert_eq!(api.string_to_string(py_str), Some("hello".to_string()));
+            api.decref(py_str);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_ruby_to_python_ascii_8bit_roundtrip_via_sendable() {
+        with_ruby_python(|ruby, api| {
+            // Ruby ASCII-8BIT String → Python bytes → SendableValue::Bytes
+            let data: &[u8] = b"\xca\xfe\xba\xbe";
+            let s = ruby.str_from_slice(data);
+            s.enc_associate(
+                ruby.find_encoding("ASCII-8BIT")
+                    .expect("ASCII-8BIT must exist"),
+            )
+            .unwrap();
+
+            // Ruby → Python
+            let py_obj = ruby_to_python(s.as_value(), api).expect("should convert to Python");
+            assert!(api.bytes_check(py_obj));
+
+            // Python → SendableValue
+            let sendable = python_to_sendable(py_obj, api).expect("should convert to sendable");
+            assert!(
+                matches!(&sendable, SendableValue::Bytes(v) if v == data),
+                "Full roundtrip should preserve bytes, got: {:?}",
+                sendable
+            );
+            api.decref(py_obj);
+        });
     }
 }

@@ -52,6 +52,29 @@ pub struct PythonApi {
         Symbol<'static, unsafe extern "C" fn(*mut PyObject, *mut Py_ssize_t) -> *const c_char>,
     py_unicode_type: *mut PyObject,
 
+    // bytes
+    py_bytes_type: *mut PyObject,
+    py_bytes_from_string_and_size:
+        Symbol<'static, unsafe extern "C" fn(v: *const c_char, len: Py_ssize_t) -> *mut PyObject>,
+    py_bytes_as_string_and_size: Symbol<
+        'static,
+        unsafe extern "C" fn(
+            o: *mut PyObject,
+            buffer: *mut *mut c_char,
+            len: *mut Py_ssize_t,
+        ) -> c_int,
+    >,
+    py_bytes_size: Symbol<'static, unsafe extern "C" fn(o: *mut PyObject) -> Py_ssize_t>,
+
+    // bytearray
+    py_bytearray_type: *mut PyObject,
+    py_bytearray_from_object:
+        Symbol<'static, unsafe extern "C" fn(o: *mut PyObject) -> *mut PyObject>,
+    py_bytearray_from_string_and_size:
+        Symbol<'static, unsafe extern "C" fn(str: *const c_char, len: Py_ssize_t) -> *mut PyObject>,
+    py_bytearray_size: Symbol<'static, unsafe extern "C" fn(o: *mut PyObject) -> Py_ssize_t>,
+    py_bytearray_as_string: Symbol<'static, unsafe extern "C" fn(o: *mut PyObject) -> *mut c_char>,
+
     // Collection Functions
 
     // Tuple
@@ -258,6 +281,34 @@ impl PythonApi {
             unsafe extern "C" fn(*mut PyObject, *mut Py_ssize_t) -> *const c_char,
         > = lib.get(b"PyUnicode_AsUTF8AndSize")?;
         let py_unicode_type: *mut PyObject = *lib.get::<*mut PyObject>(b"PyUnicode_Type")?;
+
+        // bytes
+        let py_bytes_type = *lib.get::<*mut PyObject>(b"PyBytes_Type")?;
+        let py_bytes_from_string_and_size: Symbol<
+            unsafe extern "C" fn(*const c_char, Py_ssize_t) -> *mut PyObject,
+        > = lib.get(b"PyBytes_FromStringAndSize")?;
+        let py_bytes_as_string_and_size: Symbol<
+            unsafe extern "C" fn(
+                o: *mut PyObject,
+                buffer: *mut *mut c_char,
+                len: *mut Py_ssize_t,
+            ) -> c_int,
+        > = lib.get(b"PyBytes_AsStringAndSize")?;
+        let py_bytes_size: Symbol<unsafe extern "C" fn(*mut PyObject) -> Py_ssize_t> =
+            lib.get(b"PyBytes_Size")?;
+
+        // bytearray
+        let py_bytearray_type = *lib.get::<*mut PyObject>(b"PyByteArray_Type")?;
+        let py_bytearray_from_object: Symbol<unsafe extern "C" fn(*mut PyObject) -> *mut PyObject> =
+            lib.get(b"PyByteArray_FromObject")?;
+        let py_bytearray_from_string_and_size: Symbol<
+            unsafe extern "C" fn(*const c_char, Py_ssize_t) -> *mut PyObject,
+        > = lib.get(b"PyByteArray_FromStringAndSize")?;
+        let py_bytearray_size: Symbol<unsafe extern "C" fn(*mut PyObject) -> Py_ssize_t> =
+            lib.get(b"PyByteArray_Size")?;
+        let py_bytearray_as_string: Symbol<unsafe extern "C" fn(*mut PyObject) -> *mut c_char> =
+            lib.get(b"PyByteArray_AsString")?;
+
         // Collection Functions
         // Tuple
         let py_tuple_new: Symbol<unsafe extern "C" fn(isize) -> *mut PyObject> =
@@ -446,6 +497,22 @@ impl PythonApi {
             py_unicode_from_string_and_size: std::mem::transmute(py_unicode_from_string_and_size),
             py_unicode_as_utf8_and_size: std::mem::transmute(py_unicode_as_utf8_and_size),
             py_unicode_type,
+
+            // bytes
+            py_bytes_type,
+            py_bytes_from_string_and_size: std::mem::transmute(py_bytes_from_string_and_size),
+            py_bytes_as_string_and_size: std::mem::transmute(py_bytes_as_string_and_size),
+            py_bytes_size: std::mem::transmute(py_bytes_size),
+
+            // bytearray
+            py_bytearray_type,
+            py_bytearray_from_object: std::mem::transmute(py_bytearray_from_object),
+            py_bytearray_from_string_and_size: std::mem::transmute(
+                py_bytearray_from_string_and_size,
+            ),
+            py_bytearray_size: std::mem::transmute(py_bytearray_size),
+            py_bytearray_as_string: std::mem::transmute(py_bytearray_as_string),
+
             // Collections
             // Tuple
             py_tuple_new: std::mem::transmute(py_tuple_new),
@@ -733,6 +800,75 @@ impl PythonApi {
         } else {
             Err("expected bool".to_string())
         }
+    }
+
+    pub fn bytes_check(&self, obj: *mut PyObject) -> bool {
+        if obj.is_null() {
+            return false;
+        }
+        unsafe { (self.py_object_is_instance)(obj, self.py_bytes_type) == 1 }
+    }
+
+    pub fn bytes_from_slice(&self, data: &[u8]) -> *mut PyObject {
+        let size = data.len() as Py_ssize_t;
+        unsafe { (self.py_bytes_from_string_and_size)(data.as_ptr() as *const c_char, size) }
+    }
+
+    pub fn bytes_to_vec(&self, obj: *mut PyObject) -> Option<Vec<u8>> {
+        if !self.bytes_check(obj) {
+            return None;
+        }
+        let mut size: Py_ssize_t = 0;
+        let mut buffer: *mut c_char = std::ptr::null_mut();
+        let result = unsafe { (self.py_bytes_as_string_and_size)(obj, &mut buffer, &mut size) };
+        if result != 0 {
+            if self.has_error() {
+                self.clear_error();
+            }
+            return None;
+        }
+        if buffer.is_null() {
+            return None;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(buffer as *const u8, size as usize) };
+        Some(slice.to_vec())
+    }
+
+    pub fn bytearray_check(&self, obj: *mut PyObject) -> bool {
+        if obj.is_null() {
+            return false;
+        }
+        unsafe { (self.py_object_is_instance)(obj, self.py_bytearray_type) == 1 }
+    }
+    pub fn bytearray_from_slice(&self, data: &[u8]) -> *mut PyObject {
+        let size = data.len() as Py_ssize_t;
+        unsafe { (self.py_bytearray_from_string_and_size)(data.as_ptr() as *const c_char, size) }
+    }
+
+    pub fn bytearray_to_vec(&self, obj: *mut PyObject) -> Option<Vec<u8>> {
+        if !self.bytearray_check(obj) {
+            return None;
+        }
+        let size = unsafe { (self.py_bytearray_size)(obj) };
+        if size < 0 {
+            if self.has_error() {
+                self.clear_error();
+            }
+            return None;
+        }
+        if size == 0 {
+            return Some(Vec::new());
+        }
+        let buffer = unsafe { (self.py_bytearray_as_string)(obj) };
+
+        if buffer.is_null() {
+            if self.has_error() {
+                self.clear_error();
+            }
+            return None;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(buffer as *const u8, size as usize) };
+        Some(slice.to_vec())
     }
 
     pub fn tuple_new(&self, size: isize) -> *mut PyObject {
@@ -6275,6 +6411,646 @@ _loop = asyncio.new_event_loop()
         assert_eq!(size, 5);
 
         api.decref(py_set);
+        api.decref(globals);
+    }
+
+    // ========== Bytes operations ==========
+
+    #[test]
+    #[serial]
+    fn test_bytes_from_slice_creates_object() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_bytes = api.bytes_from_slice(b"hello");
+        assert!(!py_bytes.is_null(), "Should create a Python bytes object");
+        assert!(api.bytes_check(py_bytes), "Should pass bytes_check");
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_roundtrip() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        for data in [
+            b"hello" as &[u8],
+            b"world",
+            b"with spaces",
+            b"unicode: caf\xc3\xa9",
+        ] {
+            let py_bytes = api.bytes_from_slice(data);
+            assert!(!py_bytes.is_null(), "Failed to create bytes for {:?}", data);
+
+            let back = api.bytes_to_vec(py_bytes);
+            assert_eq!(
+                back.as_deref(),
+                Some(data),
+                "Roundtrip failed for {:?}",
+                data
+            );
+            api.decref(py_bytes);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_empty() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_bytes = api.bytes_from_slice(b"");
+        assert!(!py_bytes.is_null(), "Should create empty Python bytes");
+        assert!(api.bytes_check(py_bytes));
+
+        let back = api.bytes_to_vec(py_bytes);
+        assert_eq!(back, Some(Vec::new()), "Empty bytes should roundtrip");
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_with_null_bytes() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let data: &[u8] = b"\x00\x01\x02\x00\xff\xfe\x00";
+        let py_bytes = api.bytes_from_slice(data);
+        assert!(!py_bytes.is_null());
+
+        let back = api.bytes_to_vec(py_bytes);
+        assert_eq!(
+            back.as_deref(),
+            Some(data),
+            "Bytes with embedded NULs must roundtrip exactly"
+        );
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_with_all_byte_values() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let data: Vec<u8> = (0..=255).collect();
+        let py_bytes = api.bytes_from_slice(&data);
+        assert!(!py_bytes.is_null());
+
+        let back = api.bytes_to_vec(py_bytes);
+        assert_eq!(
+            back.as_deref(),
+            Some(data.as_slice()),
+            "All 256 byte values must roundtrip"
+        );
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_check_type_discrimination() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_bytes = api.bytes_from_slice(b"test");
+        let py_str = api.string_from_str("test");
+        let py_int = api.long_from_i64(42);
+        let py_ba = api.bytearray_from_slice(b"test");
+
+        assert!(api.bytes_check(py_bytes), "bytes should pass bytes_check");
+        assert!(!api.bytes_check(py_str), "str should fail bytes_check");
+        assert!(!api.bytes_check(py_int), "int should fail bytes_check");
+        assert!(!api.bytes_check(py_ba), "bytearray should fail bytes_check");
+
+        api.decref(py_bytes);
+        api.decref(py_str);
+        api.decref(py_int);
+        api.decref(py_ba);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_check_null_returns_false() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        assert!(!guard.api().bytes_check(std::ptr::null_mut()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_to_vec_returns_none_for_non_bytes() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_str = api.string_from_str("not bytes");
+        assert!(api.bytes_to_vec(py_str).is_none());
+        api.decref(py_str);
+
+        let py_int = api.long_from_i64(42);
+        assert!(api.bytes_to_vec(py_int).is_none());
+        api.decref(py_int);
+
+        assert!(api.bytes_to_vec(std::ptr::null_mut()).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_size() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_empty = api.bytes_from_slice(b"");
+        assert_eq!(
+            unsafe { (api.py_bytes_size)(py_empty) },
+            0,
+            "Empty bytes should have size 0"
+        );
+        api.decref(py_empty);
+
+        let py_hello = api.bytes_from_slice(b"hello");
+        assert_eq!(
+            unsafe { (api.py_bytes_size)(py_hello) },
+            5,
+            "b\"hello\" should have size 5"
+        );
+        api.decref(py_hello);
+
+        let data_with_nulls = b"\x00\x00\x00";
+        let py_nulls = api.bytes_from_slice(data_with_nulls);
+        assert_eq!(
+            unsafe { (api.py_bytes_size)(py_nulls) },
+            3,
+            "Size must count NUL bytes"
+        );
+        api.decref(py_nulls);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_from_python_eval() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = make_globals(api);
+
+        let py_bytes = api
+            .run_string("b'hello world'", PY_EVAL_INPUT, globals, globals)
+            .expect("should eval bytes literal");
+        assert!(!py_bytes.is_null());
+        assert!(api.bytes_check(py_bytes));
+
+        let back = api.bytes_to_vec(py_bytes);
+        assert_eq!(back, Some(b"hello world".to_vec()));
+
+        api.decref(py_bytes);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_is_not_string() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_bytes = api.bytes_from_slice(b"hello");
+        let py_str = api.string_from_str("hello");
+
+        assert!(!api.is_string(py_bytes), "bytes must not pass is_string");
+        assert!(!api.bytes_check(py_str), "str must not pass bytes_check");
+
+        api.decref(py_bytes);
+        api.decref(py_str);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_large_payload() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let py_bytes = api.bytes_from_slice(&data);
+        assert!(!py_bytes.is_null());
+
+        let back = api
+            .bytes_to_vec(py_bytes)
+            .expect("should extract large bytes");
+        assert_eq!(back.len(), 10_000);
+        assert_eq!(back, data);
+
+        api.decref(py_bytes);
+    }
+
+    // ========== ByteArray operations ==========
+
+    #[test]
+    #[serial]
+    fn test_bytearray_from_slice_creates_object() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_ba = api.bytearray_from_slice(b"hello");
+        assert!(!py_ba.is_null(), "Should create a Python bytearray object");
+        assert!(api.bytearray_check(py_ba), "Should pass bytearray_check");
+        api.decref(py_ba);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_roundtrip() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        for data in [
+            b"hello" as &[u8],
+            b"world",
+            b"with spaces",
+            b"binary\xfe\xff",
+        ] {
+            let py_ba = api.bytearray_from_slice(data);
+            assert!(
+                !py_ba.is_null(),
+                "Failed to create bytearray for {:?}",
+                data
+            );
+
+            let back = api.bytearray_to_vec(py_ba);
+            assert_eq!(
+                back.as_deref(),
+                Some(data),
+                "Roundtrip failed for {:?}",
+                data
+            );
+            api.decref(py_ba);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_empty() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_ba = api.bytearray_from_slice(b"");
+        assert!(!py_ba.is_null(), "Should create empty Python bytearray");
+        assert!(api.bytearray_check(py_ba));
+
+        let back = api.bytearray_to_vec(py_ba);
+        assert_eq!(back, Some(Vec::new()), "Empty bytearray should roundtrip");
+        api.decref(py_ba);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_with_null_bytes() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let data: &[u8] = b"\x00\x01\x02\x00\xff\xfe\x00";
+        let py_ba = api.bytearray_from_slice(data);
+        assert!(!py_ba.is_null());
+
+        let back = api.bytearray_to_vec(py_ba);
+        assert_eq!(
+            back.as_deref(),
+            Some(data),
+            "Bytearray with embedded NULs must roundtrip exactly"
+        );
+        api.decref(py_ba);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_with_all_byte_values() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let data: Vec<u8> = (0..=255).collect();
+        let py_ba = api.bytearray_from_slice(&data);
+        assert!(!py_ba.is_null());
+
+        let back = api.bytearray_to_vec(py_ba);
+        assert_eq!(
+            back.as_deref(),
+            Some(data.as_slice()),
+            "All 256 byte values must roundtrip via bytearray"
+        );
+        api.decref(py_ba);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_check_type_discrimination() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_ba = api.bytearray_from_slice(b"test");
+        let py_bytes = api.bytes_from_slice(b"test");
+        let py_str = api.string_from_str("test");
+        let py_int = api.long_from_i64(42);
+
+        assert!(
+            api.bytearray_check(py_ba),
+            "bytearray should pass bytearray_check"
+        );
+        assert!(
+            !api.bytearray_check(py_bytes),
+            "bytes should fail bytearray_check"
+        );
+        assert!(
+            !api.bytearray_check(py_str),
+            "str should fail bytearray_check"
+        );
+        assert!(
+            !api.bytearray_check(py_int),
+            "int should fail bytearray_check"
+        );
+
+        api.decref(py_ba);
+        api.decref(py_bytes);
+        api.decref(py_str);
+        api.decref(py_int);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_check_null_returns_false() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        assert!(!guard.api().bytearray_check(std::ptr::null_mut()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_to_vec_returns_none_for_non_bytearray() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_str = api.string_from_str("not bytearray");
+        assert!(api.bytearray_to_vec(py_str).is_none());
+        api.decref(py_str);
+
+        let py_bytes = api.bytes_from_slice(b"not bytearray");
+        assert!(api.bytearray_to_vec(py_bytes).is_none());
+        api.decref(py_bytes);
+
+        assert!(api.bytearray_to_vec(std::ptr::null_mut()).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_size() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_empty = api.bytearray_from_slice(b"");
+        assert_eq!(
+            unsafe { (api.py_bytearray_size)(py_empty) },
+            0,
+            "Empty bytearray should have size 0"
+        );
+        api.decref(py_empty);
+
+        let py_hello = api.bytearray_from_slice(b"hello");
+        assert_eq!(
+            unsafe { (api.py_bytearray_size)(py_hello) },
+            5,
+            "bytearray(b\"hello\") should have size 5"
+        );
+        api.decref(py_hello);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_from_python_eval() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = make_globals(api);
+
+        let py_ba = api
+            .run_string("bytearray(b'hello world')", PY_EVAL_INPUT, globals, globals)
+            .expect("should eval bytearray");
+        assert!(!py_ba.is_null());
+        assert!(api.bytearray_check(py_ba));
+
+        let back = api.bytearray_to_vec(py_ba);
+        assert_eq!(back, Some(b"hello world".to_vec()));
+
+        api.decref(py_ba);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_from_object() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_bytes = api.bytes_from_slice(b"convert me");
+        let py_ba = unsafe { (api.py_bytearray_from_object)(py_bytes) };
+        assert!(!py_ba.is_null(), "Should create bytearray from bytes");
+        assert!(api.bytearray_check(py_ba));
+
+        let back = api.bytearray_to_vec(py_ba);
+        assert_eq!(back, Some(b"convert me".to_vec()));
+
+        api.decref(py_ba);
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_is_not_bytes() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_ba = api.bytearray_from_slice(b"hello");
+        let py_bytes = api.bytes_from_slice(b"hello");
+
+        assert!(
+            !api.bytes_check(py_ba),
+            "bytearray must not pass bytes_check"
+        );
+        assert!(
+            !api.bytearray_check(py_bytes),
+            "bytes must not pass bytearray_check"
+        );
+        assert!(!api.is_string(py_ba), "bytearray must not pass is_string");
+
+        api.decref(py_ba);
+        api.decref(py_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_large_payload() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let py_ba = api.bytearray_from_slice(&data);
+        assert!(!py_ba.is_null());
+
+        let back = api
+            .bytearray_to_vec(py_ba)
+            .expect("should extract large bytearray");
+        assert_eq!(back.len(), 10_000);
+        assert_eq!(back, data);
+
+        api.decref(py_ba);
+    }
+
+    // ========== Cross-type bytes/bytearray tests ==========
+
+    #[test]
+    #[serial]
+    fn test_bytes_and_bytearray_same_content_different_types() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let data = b"identical content";
+        let py_bytes = api.bytes_from_slice(data);
+        let py_ba = api.bytearray_from_slice(data);
+
+        // Same content
+        let bytes_vec = api.bytes_to_vec(py_bytes).unwrap();
+        let ba_vec = api.bytearray_to_vec(py_ba).unwrap();
+        assert_eq!(bytes_vec, ba_vec, "Same input should produce same content");
+
+        // Different types
+        assert!(api.bytes_check(py_bytes));
+        assert!(!api.bytearray_check(py_bytes));
+        assert!(api.bytearray_check(py_ba));
+        assert!(!api.bytes_check(py_ba));
+
+        api.decref(py_bytes);
+        api.decref(py_ba);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_and_bytearray_neither_is_string() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+
+        let py_bytes = api.bytes_from_slice(b"data");
+        let py_ba = api.bytearray_from_slice(b"data");
+        let py_str = api.string_from_str("data");
+
+        assert!(!api.is_string(py_bytes));
+        assert!(!api.is_string(py_ba));
+        assert!(api.is_string(py_str));
+
+        assert!(!api.bytes_check(py_str));
+        assert!(!api.bytearray_check(py_str));
+
+        api.decref(py_bytes);
+        api.decref(py_ba);
+        api.decref(py_str);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytes_python_equality_with_rust() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = make_globals(api);
+
+        // Create bytes in Python with hex escapes and verify Rust reads them correctly
+        let py_bytes = api
+            .run_string(
+                "b'\\x00\\x01\\x02\\xfd\\xfe\\xff'",
+                PY_EVAL_INPUT,
+                globals,
+                globals,
+            )
+            .expect("should eval hex bytes");
+        assert!(api.bytes_check(py_bytes));
+
+        let back = api.bytes_to_vec(py_bytes).unwrap();
+        assert_eq!(back, vec![0x00, 0x01, 0x02, 0xfd, 0xfe, 0xff]);
+
+        api.decref(py_bytes);
+        api.decref(globals);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bytearray_python_concatenation() {
+        let Some(guard) = skip_if_no_python() else {
+            return;
+        };
+        let api = guard.api();
+        let globals = make_globals(api);
+
+        let py_ba = api
+            .run_string(
+                "bytearray(b'hello') + bytearray(b' world')",
+                PY_EVAL_INPUT,
+                globals,
+                globals,
+            )
+            .expect("should eval bytearray concat");
+        assert!(api.bytearray_check(py_ba));
+
+        let back = api.bytearray_to_vec(py_ba).unwrap();
+        assert_eq!(back, b"hello world");
+
+        api.decref(py_ba);
         api.decref(globals);
     }
 }

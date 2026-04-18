@@ -73,6 +73,7 @@ mod tests {
     use crate::stream::SendableValue;
     use crate::test_helpers::{skip_if_no_python, with_ruby_python};
     use crossbeam_channel::{bounded, unbounded};
+    use magnus::encoding::EncodingCapable;
     use magnus::value::ReprValue;
     use magnus::TryConvert;
     use serial_test::serial;
@@ -945,6 +946,173 @@ mod tests {
             let hash = magnus::RHash::try_convert(hash_val).expect("should be Hash");
             let v: i64 = hash.fetch("k").unwrap();
             assert_eq!(v, 99);
+        });
+    }
+
+    // ========== SendableValue::Bytes → Ruby String (ASCII-8BIT) ==========
+
+    #[test]
+    #[serial]
+    fn test_sendable_bytes_converts_to_ruby_string() {
+        with_ruby_python(|ruby, _api| {
+            let val: magnus::Value = SendableValue::Bytes(b"hello".to_vec())
+                .try_into()
+                .expect("Bytes conversion should succeed");
+
+            // Must be a Ruby String, not an Array of integers
+            let rstr = magnus::RString::try_convert(val).expect("should be a String");
+            let content = unsafe { rstr.as_slice() };
+            assert_eq!(content, b"hello");
+
+            // Verify encoding is ASCII-8BIT
+            let enc = rstr.enc_get();
+            let ascii_8bit = ruby
+                .find_encindex("ASCII-8BIT")
+                .expect("ASCII-8BIT must exist");
+            assert!(
+                enc == ascii_8bit,
+                "Bytes should produce ASCII-8BIT encoded String"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_sendable_bytes_empty() {
+        with_ruby_python(|ruby, _api| {
+            let val: magnus::Value = SendableValue::Bytes(Vec::new())
+                .try_into()
+                .expect("empty Bytes conversion should succeed");
+
+            let rstr = magnus::RString::try_convert(val).expect("should be a String");
+            let content = unsafe { rstr.as_slice() };
+            assert!(content.is_empty());
+
+            let enc = rstr.enc_get();
+            let ascii_8bit = ruby
+                .find_encindex("ASCII-8BIT")
+                .expect("ASCII-8BIT must exist");
+            assert!(enc == ascii_8bit, "encoding should be ASCII-8BIT");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_sendable_bytes_with_null_bytes() {
+        with_ruby_python(|ruby, _api| {
+            let data = vec![0x00, 0x01, 0xff, 0x00, 0xfe];
+            let val: magnus::Value = SendableValue::Bytes(data.clone())
+                .try_into()
+                .expect("Bytes with NULs should convert");
+
+            let rstr = magnus::RString::try_convert(val).expect("should be a String");
+            let content = unsafe { rstr.as_slice() };
+            assert_eq!(content, data.as_slice());
+
+            let enc = rstr.enc_get();
+            let ascii_8bit = ruby
+                .find_encindex("ASCII-8BIT")
+                .expect("ASCII-8BIT must exist");
+            assert!(enc == ascii_8bit, "encoding should be ASCII-8BIT");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_sendable_bytes_all_256_values() {
+        with_ruby_python(|ruby, _api| {
+            let data: Vec<u8> = (0..=255).collect();
+            let val: magnus::Value = SendableValue::Bytes(data.clone())
+                .try_into()
+                .expect("all byte values should convert");
+
+            let rstr = magnus::RString::try_convert(val).expect("should be a String");
+            let content = unsafe { rstr.as_slice() };
+            assert_eq!(content, data.as_slice());
+
+            let enc = rstr.enc_get();
+            let ascii_8bit = ruby
+                .find_encindex("ASCII-8BIT")
+                .expect("ASCII-8BIT must exist");
+            assert!(enc == ascii_8bit, "encoding should be ASCII-8BIT");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_sendable_bytes_is_not_array() {
+        with_ruby_python(|_ruby, _api| {
+            let val: magnus::Value = SendableValue::Bytes(b"test".to_vec())
+                .try_into()
+                .expect("Bytes conversion should succeed");
+
+            // Must NOT be an Array (Vec<u8>.into_value would produce Array<Integer>)
+            assert!(
+                magnus::RArray::try_convert(val).is_err(),
+                "Bytes must not convert to Ruby Array"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_sendable_bytes_in_stream_delivery() {
+        with_ruby_python(|ruby, _api| {
+            let (tx, rx) = unbounded();
+            let (cancel_tx, _cancel_rx) = bounded(1);
+
+            thread::spawn(move || {
+                tx.send(Some(SendableValue::Integer(1))).ok();
+                tx.send(Some(SendableValue::Bytes(b"\xde\xad".to_vec())))
+                    .ok();
+                tx.send(Some(SendableValue::Str("after".to_string()))).ok();
+                tx.send(None).ok();
+            });
+
+            let mut stream = crate::stream::AsyncStream::from_channel(rx, cancel_tx);
+
+            // First: integer
+            let val = stream.next().unwrap().unwrap();
+            assert_eq!(i64::try_convert(val).unwrap(), 1);
+
+            // Second: bytes → ASCII-8BIT String
+            let val = stream.next().unwrap().unwrap();
+            let rstr = magnus::RString::try_convert(val).expect("should be String");
+            let content = unsafe { rstr.as_slice() };
+            assert_eq!(content, b"\xde\xad");
+            let enc = rstr.enc_get();
+            let ascii_8bit = ruby
+                .find_encindex("ASCII-8BIT")
+                .expect("ASCII-8BIT must exist");
+            assert!(enc == ascii_8bit, "encoding should be ASCII-8BIT");
+
+            // Third: regular string
+            let val = stream.next().unwrap().unwrap();
+            assert_eq!(String::try_convert(val).unwrap(), "after");
+
+            assert!(stream.next().is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_sendable_bytes_large_payload() {
+        with_ruby_python(|ruby, _api| {
+            let data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+            let val: magnus::Value = SendableValue::Bytes(data.clone())
+                .try_into()
+                .expect("large Bytes should convert");
+
+            let rstr = magnus::RString::try_convert(val).expect("should be a String");
+            let content = unsafe { rstr.as_slice() };
+            assert_eq!(content.len(), 10_000);
+            assert_eq!(content, data.as_slice());
+
+            let enc = rstr.enc_get();
+            let ascii_8bit = ruby
+                .find_encindex("ASCII-8BIT")
+                .expect("ASCII-8BIT must exist");
+            assert!(enc == ascii_8bit, "encoding should be ASCII-8BIT");
         });
     }
 }

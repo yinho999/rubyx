@@ -93,7 +93,7 @@ dependencies = []
 
 ```python
 # app/python/example.py
-def hello(name="World"):
+def hello(name):
     return f"Hello, {name}! From Python."
 ```
 
@@ -102,7 +102,7 @@ def hello(name="World"):
 class GreetingsController < ApplicationController
   def index
     example = Rubyx.import('example')
-    render json: { message: example.hello(params[:name]).to_ruby }
+    render json: { message: example.hello(params[:name] || 'World').to_ruby }
   end
 end
 ```
@@ -159,7 +159,7 @@ class TasksController < ApplicationController
     tasks = Rubyx.import('tasks')
 
     # Non-blocking — returns a Future immediately
-    future = Rubyx.async_await(tasks.delayed_greet(params[:name], seconds: 2))
+    future = Rubyx.async_await(tasks.delayed_greet(params[:name] || 'World', seconds: 2))
     do_other_work()
     render json: { message: future.await.to_ruby }
   end
@@ -331,7 +331,29 @@ Rubyx.eval("f'Hello, {name}!'", name: "World").to_ruby # => "Hello, World!"
 Rubyx.eval("max(items)", items: [3, 1, 4, 1, 5]).to_ruby # => 5
 ```
 
-Supports: Integer, Float, String, Symbol, Bool, nil, Array, Hash, and RubyxObject.
+Supports: Integer, Float, String, Symbol, Bool, nil, Array, Hash, binary String (ASCII-8BIT), and RubyxObject.
+
+## Bytes / Binary Data
+
+Python `bytes` and `bytearray` convert to Ruby `String` with `ASCII-8BIT` encoding. Ruby binary strings (`.b`) convert to Python `bytes`:
+
+```ruby
+# Python bytes → Ruby
+Rubyx.eval("b'hello'").to_ruby # => "hello" (ASCII-8BIT)
+Rubyx.eval("bytearray(b'hello')").to_ruby # => "hello" (ASCII-8BIT)
+
+# Ruby → Python
+ctx = Rubyx.context
+ctx.eval("type(data).__name__", data: "hello".b) # => "bytes"
+ctx.eval("type(data).__name__", data: "hello")   # => "str"
+
+# Roundtrip binary data
+ctx.eval("data", data: "\xff\x00\xfe".b).to_ruby # => "\xFF\x00\xFE" (ASCII-8BIT)
+
+# Works with Python stdlib
+ctx.eval("import base64")
+ctx.eval("base64.b64encode(raw)", raw: "Hello".b).to_ruby # => "SGVsbG8=" (ASCII-8BIT)
+```
 
 ## Python Objects
 
@@ -469,6 +491,37 @@ svc.Analyzer([1, 2, 3]).summary.to_ruby # => {"count" => 3, "sum" => 6}
 | `.truthy?` / `.falsy?`   | Python truthiness             |
 | `.callable?`             | Check if callable             |
 | `.py_type`               | Python type name              |
+
+## Type Conversion
+
+| Python                | Ruby                         | Notes                  |
+|-----------------------|------------------------------|------------------------|
+| `int`                 | `Integer`                    |                        |
+| `float`               | `Float`                      |                        |
+| `str`                 | `String` (UTF-8)             |                        |
+| `bytes`               | `String` (ASCII-8BIT)        | binary data            |
+| `bytearray`           | `String` (ASCII-8BIT)        | binary data            |
+| `bool`                | `true` / `false`             |                        |
+| `None`                | `nil`                        |                        |
+| `list` / `tuple`      | `Array`                      |                        |
+| `dict`                | `Hash`                       |                        |
+| `set` / `frozenset`   | `Array`                      |                        |
+| everything else       | `RubyxObject`                | proxy to Python object |
+
+**Ruby → Python** (via globals/kwargs):
+
+| Ruby                           | Python      |
+|--------------------------------|-------------|
+| `Integer`                      | `int`       |
+| `Float`                        | `float`     |
+| `String` (UTF-8)               | `str`       |
+| `String` (ASCII-8BIT / `.b`)   | `bytes`     |
+| `true` / `false`               | `bool`      |
+| `nil`                          | `None`      |
+| `Array`                        | `list`      |
+| `Hash`                         | `dict`      |
+| `Symbol`                       | `str`       |
+| `RubyxObject`                  | original    |
 
 ## Requirements
 
