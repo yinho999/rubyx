@@ -14,6 +14,7 @@ Powered by Rust for safety and performance. Built for Rails. Inspired by [Python
 [![Ruby](https://img.shields.io/badge/Ruby-%3E%3D%203.0-red.svg)](https://www.ruby-lang.org)
 [![Rust](https://img.shields.io/badge/Rust-powered-orange.svg)](https://www.rust-lang.org)
 > *"Rubyx showed that the proxy-object pattern works beautifully for cross-language bridges in Rust, and its magnus + rb-sys architecture is exactly what [Boax](https://intertwingly.net/blog/2026/03/25/Calling-JavaScript-from-Ruby.html) uses."*
+> 
 > — [Sam Ruby](https://en.wikipedia.org/wiki/Sam_Ruby), author of *Agile Web Development with Rails*
 </div>
 
