@@ -1,0 +1,52 @@
+name: AddressSanitizer CI workflow
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  asan:
+    name: AddressSanitizer Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      - name: Install Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ruby-3.4
+
+      - name: Set Ruby library path
+        run: echo "LD_LIBRARY_PATH=$(ruby -e 'puts RbConfig::CONFIG["libdir"]'):$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Run ASAN tests
+        env:
+          # Enable AddressSanitizer
+          # https://doc.rust-lang.org/unstable-book/compiler-flags/sanitizer.html#addresssanitizer
+          RUSTFLAGS: "-Zsanitizer=address"
+          # Force libc malloc so Python allocations are visible to ASAN
+          # https://docs.python.org/3/c-api/memory.html#envvar-PYTHONMALLOC
+          PYTHONMALLOC: malloc
+          # Disable ASAN options that are known to cause Ruby GC false positives
+          # https://github.com/google/sanitizers/wiki/AddressSanitizerFlags
+          ASAN_OPTIONS: "detect_stack_use_after_return=0:detect_leaks=0:use_sigaltstack=0"
+        # Nightly required for -Zsanitizer
+        run: cargo +nightly test --target x86_64-unknown-linux-gnu
