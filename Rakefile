@@ -1,6 +1,6 @@
+require 'bundler/gem_tasks'
 require 'rb_sys/extensiontask'
 require 'rspec/core/rake_task'
-
 RSpec::Core::RakeTask.new(:spec)
 
 GEMSPEC = Gem::Specification.load('rubyx.gemspec')
